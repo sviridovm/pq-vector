@@ -3,6 +3,8 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pq_vector::{IndexBuilder, has_pq_vector_index};
 use std::path::Path;
 
+pub use pq_vector::MultiIndexBuilder;
+
 #[allow(unused)]
 pub fn read_embedding_at_row(
     path: &Path,

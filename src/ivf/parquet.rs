@@ -28,6 +28,16 @@ pub struct IndexBuilder {
     seed: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct MultiIndexBuilder {
+    sources: Vec<PathBuf>,
+    embedding_column: String,
+    n_clusters: Option<usize>,
+    max_iters: usize,
+    seed: u64,
+}
+
+
 impl IndexBuilder {
     pub fn new(source: impl AsRef<Path>, embedding_column: impl AsRef<str>) -> Self {
         Self {
@@ -101,6 +111,99 @@ impl IndexBuilder {
         })
     }
 }
+
+impl MultiIndexBuilder {
+    pub fn new<I, P>(sources: I, embedding_column: impl AsRef<str>) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>
+    {
+        let sources = sources
+            .into_iter()
+            .map(|p| p.as_ref().to_path_buf())
+            .collect();
+
+        Self {
+            sources: sources,
+            embedding_column: embedding_column.as_ref().to_string(),
+            n_clusters: None,
+            max_iters: 20,
+            seed: 42,
+        }
+    }
+
+    pub fn n_clusters(mut self, n_clusters: usize) -> Self {
+        self.n_clusters = Some(n_clusters);
+        self
+    }
+
+    pub fn max_iters(mut self, max_iters: usize) -> Self {
+        self.max_iters = max_iters;
+        self
+    }
+
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    pub fn build_all_inplace(self) -> Result<(), Box<dyn std::error::Error>> {
+        let config = self.build_config()?;
+        let embedding_column = EmbeddingColumn::try_from(self.embedding_column)?;
+
+        for source in self.sources {
+            let parquet = read_parquet_with_embeddings(source.as_path(), &embedding_column)?;
+            let index = build_ivf_index(&parquet.embeddings, config)?;
+            let plan = ParquetIndexAppend {
+                path: source.as_path(),
+                index: &index,
+                embedding_column: &embedding_column,
+            };
+            append_index_inplace(plan)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn build_new(self, output: impl AsRef<Path>) -> Result<(), Box<dyn std::error::Error>> {
+        let config = self.build_config()?;
+        let embedding_column = EmbeddingColumn::try_from(self.embedding_column)?;
+
+        for source in self.sources {
+            let parquet = read_parquet_with_embeddings(source.as_path(), &embedding_column)?;
+            let index = build_ivf_index(&parquet.embeddings, config)?;
+            let plan = ParquetWritePlan {
+                source: source.as_path(),
+                path: output.as_ref(),
+                batches: &parquet.batches,
+                schema: parquet.schema,
+                index: &index,
+                embedding_column: &embedding_column,
+            };
+            write_parquet_with_index(plan)?;
+
+        }
+
+        Ok(())
+    }
+
+    fn build_config(&self) -> Result<IvfBuildConfig, Box<dyn std::error::Error>> {
+        if self.max_iters == 0 {
+            return Err("max_iters must be > 0".into());
+        }
+        let n_clusters = match self.n_clusters {
+            Some(0) => return Err("n_clusters must be > 0".into()),
+            Some(value) => Some(ClusterCount::new(value)?),
+            None => None,
+        };
+        Ok(IvfBuildConfig {
+            n_clusters,
+            max_iters: self.max_iters,
+            seed: self.seed,
+        })
+    }
+}
+
 
 /// Magic bytes to identify our pq-vector index format.
 const PQ_VECTOR_INDEX_MAGIC: &[u8] = b"PQ_VECTOR1";
