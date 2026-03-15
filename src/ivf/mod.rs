@@ -12,7 +12,7 @@ use std::num::NonZeroU32;
 
 pub use index::ClusterCount;
 pub use parquet::{IndexBuilder, has_pq_vector_index, MultiIndexBuilder};
-pub use search::{SearchResult, TopkBuilder};
+pub use search::{SearchResult, TopkBuilder, MultiTopkBuilder};
 
 /// Non-empty embedding column name.
 #[derive(Debug, Clone, PartialEq, Eq)]

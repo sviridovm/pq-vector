@@ -5,8 +5,11 @@ use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::iter::Map;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use futures::future::join_all;
+use futures::TryFutureExt;
 
 // For max-heap (we want to pop largest distances).
 #[derive(Debug, Clone)]
@@ -53,6 +56,7 @@ pub struct TopkBuilder<'a> {
     nprobe: Option<NonZeroUsize>,
 }
 
+
 impl<'a> TopkBuilder<'a> {
     pub fn new(parquet_path: impl AsRef<Path>, query: &'a [f32]) -> Self {
         Self {
@@ -77,6 +81,69 @@ impl<'a> TopkBuilder<'a> {
         let k = self.k.ok_or("k must be set")?;
         let nprobe = self.nprobe.ok_or("nprobe must be set")?;
         topk(self.parquet_path.as_path(), self.query, k, nprobe).await
+    }
+}
+
+
+#[derive(Debug, Clone)]
+pub struct MultiTopkBuilder<'a> {
+    parquet_paths: Vec<PathBuf>,
+    query: &'a [f32],
+    k: Option<NonZeroUsize>,
+    nprobe: Option<NonZeroUsize>,
+    nonuniform_probe_count: bool
+}
+
+impl<'a> MultiTopkBuilder<'a> {
+    pub fn new<I, P>(parquet_paths: I, query: &'a [f32]) -> Self
+    where
+        I: IntoIterator<Item=P>,
+        P: AsRef<Path>
+    {
+        let paths = parquet_paths
+            .into_iter()
+            .map(|p| p.as_ref().to_path_buf())
+            .collect();
+
+        Self {
+            parquet_paths: paths,
+            query,
+            k: None,
+            nprobe: None,
+            nonuniform_probe_count: false
+        }
+    }
+
+    pub fn k(mut self, k: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        self.k = Some(NonZeroUsize::new(k).ok_or("k must be > 0")?);
+        Ok(self)
+    }
+
+    pub fn nprobe(mut self, nprobe: usize) -> Result<Self, Box<dyn std::error::Error>> {
+        self.nprobe = Some(NonZeroUsize::new(nprobe).ok_or("nprobe must be > 0")?);
+        Ok(self)
+    }
+
+    pub async fn search(self) -> Result<Vec<SearchResult>, Box<dyn std::error::Error>> {
+        let k = self.k.ok_or("k must be set")?;
+        let nprobe = self.nprobe.ok_or("nprobe must be set")?;
+        let futures = self.parquet_paths.iter().map(|path| {
+            topk(path, self.query, k, nprobe)
+        });
+
+        // let results: Vec<Result<Vec<SearchResult>, Box<dyn std::error::Error>>> = join_all(futures).await;
+
+        let mut all_results: Vec<SearchResult> =
+            join_all(futures)
+                .await
+                .into_iter()
+                .filter_map(Result::ok)
+                .flatten()
+                .collect();
+
+        all_results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+
+        Ok(all_results)
     }
 }
 
