@@ -147,6 +147,32 @@ impl IvfIndex {
             .map(|(idx, _)| idx)
             .collect()
     }
+
+    pub(crate) fn get_centroid_distances(&self, query: &[f32]) -> Vec<f32> {
+        (0..self.n_clusters.as_usize())
+            .map(|i| {
+                let centroid_start = i * self.dim.as_usize();
+                let centroid =
+                    &self.centroids[centroid_start..centroid_start + self.dim.as_usize()];
+                squared_l2_distance(query, centroid)
+            })
+            .collect()
+    }
+
+
+    // pub(crate) fn get_inverted_list(&self, cluster_idx: u32) -> &[u32] {
+    //     &self.inverted_lists[cluster_idx as usize]
+    // }
+
+    pub(crate) fn get_rows_for_cluster(&self, cluster_idx: u32) -> Vec<u32> {
+        self.inverted_lists[cluster_idx as usize].clone()
+    }
+
+    pub(crate) fn get_num_clusters(&self) -> usize {
+        self.n_clusters.as_usize()
+    }
+
+
 }
 
 pub(crate) fn build_ivf_index(

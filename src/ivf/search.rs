@@ -5,11 +5,9 @@ use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::{ArrowReaderOptions, RowSelection, RowSelector};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::iter::Map;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use futures::future::join_all;
-use futures::TryFutureExt;
 
 // For max-heap (we want to pop largest distances).
 #[derive(Debug, Clone)]
@@ -39,6 +37,36 @@ impl Ord for HeapItem {
             .unwrap_or(Ordering::Equal)
     }
 }
+
+
+struct HeapItemWithSource {
+    row_idx: u32,
+    distance: f32,
+    source_file: PathBuf,
+}
+
+impl PartialEq for HeapItemWithSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.distance == other.distance
+    }
+}
+
+impl Eq for HeapItemWithSource {}
+
+impl PartialOrd for HeapItemWithSource {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HeapItemWithSource {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.distance
+            .partial_cmp(&other.distance)
+            .unwrap_or(Ordering::Equal)
+    }
+}
+
 
 /// Result item from top-k search.
 #[derive(Debug, Clone)]
@@ -91,7 +119,6 @@ pub struct MultiTopkBuilder<'a> {
     query: &'a [f32],
     k: Option<NonZeroUsize>,
     nprobe: Option<NonZeroUsize>,
-    nonuniform_probe_count: bool
 }
 
 impl<'a> MultiTopkBuilder<'a> {
@@ -110,7 +137,6 @@ impl<'a> MultiTopkBuilder<'a> {
             query,
             k: None,
             nprobe: None,
-            nonuniform_probe_count: false
         }
     }
 
@@ -145,6 +171,149 @@ impl<'a> MultiTopkBuilder<'a> {
 
         Ok(all_results)
     }
+
+    pub async fn nonuniform_search(self) -> Result<Vec<SearchResult>, Box<dyn std::error::Error>> {
+        let k = self.k.ok_or("k must be set")?;
+        let nprobe = self.nprobe.ok_or("nprobe must be set")?;
+        let clusters_to_search = nprobe.get() * self.parquet_paths.len();
+        let dim = self.query.len();
+
+
+        let mut heap: BinaryHeap<HeapItemWithSource> = BinaryHeap::with_capacity(clusters_to_search);
+
+        //     query all centroids from all files
+        for parquet_path in self.parquet_paths {
+            let parquet_path = parquet_path.as_path();
+            let (index, embedding_column) = read_index_from_parquet(parquet_path)?;
+            
+            let centroid_distances = index.get_centroid_distances(self.query);
+
+            centroid_distances.iter().enumerate().for_each(|(centroid_idx, distance)| {
+                heap.push(HeapItemWithSource {
+                    row_idx: centroid_idx as u32,
+                    distance: *distance,
+                    source_file: parquet_path.to_path_buf(),
+                });
+            });
+
+        }
+
+        
+        // group by source file and read embeddings for all selected centroids in that file
+        let files_to_search: Vec<(PathBuf, Vec<u32>)> = heap.into_sorted_vec()
+            .into_iter()
+            .take(clusters_to_search)
+            .fold(std::collections::HashMap::<PathBuf, Vec<u32>>::new(), |mut acc, item| {
+                acc.entry(item.source_file)
+                    .or_default()
+                    .push(item.row_idx);
+                acc
+            })
+            .into_iter()
+            .collect();
+
+
+            
+        // let rows_to_check_futures = files_to_search.iter().map(|(parquet_path, cluster_idxs)| async move {
+        //         let (index, _) = read_index_from_parquet(parquet_path).ok()?;
+
+        //         Some(
+        //             cluster_idxs
+        //                 .iter()
+        //                 .flat_map(|&cluster_idx| index.get_rows_for_cluster(cluster_idx))
+        //                 .collect::<Vec<u32>>(),
+        //         )
+        //     });
+
+        let rows_to_check_futures = files_to_search.iter().map(|(parquet_path, cluster_idxs)| async move {
+            read_index_from_parquet(parquet_path)
+                .ok()
+                .map(|(index, _)| {
+                    cluster_idxs
+                        .iter()
+                        .flat_map(|&cluster_idx| index.get_rows_for_cluster(cluster_idx))
+                        .collect::<Vec<u32>>()
+                })
+        });
+
+
+        let rows_to_check: Vec<u32> = join_all(rows_to_check_futures)
+            .await
+            .into_iter()
+            .flatten()      // remove None
+            .flatten()      // flatten Vec<Vec<u32>>
+            .collect();
+
+        let files_to_search_ref = &files_to_search;
+
+        let futures = rows_to_check
+            .chunks(1000)
+            .map(|chunk| {
+                let files_to_search = files_to_search_ref;
+
+                async move {
+                    let parquet_path = files_to_search
+                        .iter()
+                        .find(|(_, cluster_idxs)| cluster_idxs.contains(&chunk[0]))
+                        .map(|(path, _)| path)
+                        .unwrap();
+
+                    let (index, embedding_column) = read_index_from_parquet(parquet_path).ok()?;
+
+                    read_embeddings_for_rows(
+                        EmbeddingReadContext {
+                            path: parquet_path,
+                            embedding_column: &embedding_column,
+                            dim: index_dim(&index),
+                        },
+                        chunk,
+                    )
+                    .await
+                    .ok()
+                }
+            });
+
+        let embeddings: Vec<f32> = join_all(futures).await.into_iter().filter(|x| x.is_some()).flatten().flatten().collect();
+        
+
+        let mut heap: BinaryHeap<HeapItem> = BinaryHeap::with_capacity(k.get() + 1);
+
+        for (i, &row_idx) in rows_to_check.iter().enumerate() {
+            let vec = &embeddings[i * dim..(i + 1) * dim];
+
+            let distance = squared_l2_distance(self.query, vec);
+
+            if heap.len() < k.get() {
+                heap.push(HeapItem { row_idx, distance });
+            } else if let Some(top) = heap.peek()
+                && distance < top.distance
+            {
+                heap.pop();
+                heap.push(HeapItem { row_idx, distance });
+            }
+        }
+
+        let mut results: Vec<SearchResult> = heap
+            .into_iter()
+            .map(|item| SearchResult {
+                row_idx: item.row_idx,
+                distance: item.distance.sqrt(),
+            })
+            .collect();
+        results.sort_by(|a, b| {
+            a.distance
+                .partial_cmp(&b.distance)
+                .unwrap_or(Ordering::Equal)
+        });
+
+
+
+        Ok(results)
+
+    }
+
+
+
 }
 
 async fn topk(
